@@ -87,6 +87,8 @@ def _read_response(sock, timeout=10):
     """Read one HTTP response from a raw socket. Returns (status, body) or (None, None)."""
     sock.settimeout(timeout)
     data = b""
+    # This loop has no size cap of its own. A peer that dribbles header bytes without ever
+    # sending the blank line grows my buffer until the socket timeout stops the read.
     while b"\r\n\r\n" not in data:
         chunk = sock.recv(4096)
         if not chunk:
@@ -96,6 +98,9 @@ def _read_response(sock, timeout=10):
     m = re.search(rb"HTTP/\d\.\d (\d{3})", head)
     status = int(m.group(1)) if m else None
     cl = re.search(rb"[Cc]ontent-[Ll]ength: (\d+)", head)
+    # Only Content-Length framing is understood here. A chunked crafted response leaves its
+    # chunk sizes sitting inside the body I compare, and a response with no length header at
+    # all is treated as finished at the header block, whether or not more was coming.
     if cl:
         need = int(cl.group(1))
         while len(body) < need:
@@ -182,6 +187,8 @@ def detect_http_smuggling(url, method='GET', data=None, headers=None, timeout=10
     vulnerable = False
     for name, test_headers, default_body in tests:
         merged = dict(test_headers)
+        # Custom headers win this merge, including over the test headers. A caller who passes
+        # their own Content-Length quietly disarms the conflict the test exists to create.
         merged.update(custom)
         body = data if data is not None else default_body
         marker = "/__smuggled_" + name.lower().replace(".", "")
@@ -190,6 +197,10 @@ def detect_http_smuggling(url, method='GET', data=None, headers=None, timeout=10
             logging.error(f"{name} Test: request did not complete.")
             continue
         completed += 1
+        # A positive needs the probe body to carry a marker sentence no ordinary server would
+        # ever emit for the smuggled path. A genuinely desynced server answers that request
+        # with its normal response, which I report as no vulnerability, so as written I am
+        # calibrated for a cooperating test server rather than an arbitrary one.
         if data is None and ("SMUGGLED_RESPONSE_FOR " + marker) in probe_body:
             logging.warning(f"Potential {name} HTTP Request Smuggling Vulnerability Detected: the follow-up probe was answered with the smuggled request response.")
             vulnerable = True
