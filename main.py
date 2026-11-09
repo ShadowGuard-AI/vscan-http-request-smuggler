@@ -83,33 +83,101 @@ def send_request(url, method='GET', data=None, headers=None, timeout=10, verbose
         return None, None, None
 
 
-def _read_response(sock, timeout=10):
-    """Read one HTTP response from a raw socket. Returns (status, body) or (None, None)."""
-    sock.settimeout(timeout)
-    data = b""
-    # This loop has no size cap of its own. A peer that dribbles header bytes without ever
-    # sending the blank line grows my buffer until the socket timeout stops the read.
-    while b"\r\n\r\n" not in data:
-        chunk = sock.recv(4096)
+MAX_HEADER_BYTES = 65536
+MAX_BODY_BYTES = 1048576
+
+
+class _Reader:
+    """Buffered socket reader with hard size caps.
+
+    A peer that floods bytes without framing can never grow the buffer
+    past the caps: exceeding a cap raises ValueError and the response is
+    reported as not completed.
+    """
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b""
+
+    def _fill(self, cap):
+        if len(self.buf) > cap:
+            raise ValueError("response exceeds size cap")
+        chunk = self.sock.recv(4096)
         if not chunk:
+            raise EOFError("connection closed")
+        self.buf += chunk
+        if len(self.buf) > cap:
+            raise ValueError("response exceeds size cap")
+
+    def read_until(self, marker, cap):
+        while marker not in self.buf:
+            self._fill(cap)
+        idx = self.buf.index(marker) + len(marker)
+        out, self.buf = self.buf[:idx], self.buf[idx:]
+        return out
+
+    def read_exact(self, n, cap):
+        if n > cap:
+            raise ValueError("response exceeds size cap")
+        while len(self.buf) < n:
+            self._fill(cap)
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def read_line(self, cap):
+        return self.read_until(b"\r\n", cap)
+
+
+def _read_response(sock, timeout=10):
+    """Read one HTTP response from a raw socket. Returns (status, body) or (None, None).
+
+    Handles Content-Length and chunked Transfer-Encoding framing, with
+    size caps on both the header block and the body. A response with
+    neither framing header is treated as complete at the header block,
+    because the connection is kept alive for the probe request that
+    follows and there is no end of body signal to wait for.
+    """
+    sock.settimeout(timeout)
+    reader = _Reader(sock)
+    try:
+        head_block = reader.read_until(b"\r\n\r\n", MAX_HEADER_BYTES)
+        head = head_block[:-4]
+        m = re.search(rb"HTTP/\d\.\d (\d{3})", head)
+        status = int(m.group(1)) if m else None
+        if status is None:
             return None, None
-        data += chunk
-    head, body = data.split(b"\r\n\r\n", 1)
-    m = re.search(rb"HTTP/\d\.\d (\d{3})", head)
-    status = int(m.group(1)) if m else None
-    cl = re.search(rb"[Cc]ontent-[Ll]ength: (\d+)", head)
-    # Only Content-Length framing is understood here. A chunked crafted response leaves its
-    # chunk sizes sitting inside the body I compare, and a response with no length header at
-    # all is treated as finished at the header block, whether or not more was coming.
-    if cl:
-        need = int(cl.group(1))
-        while len(body) < need:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            body += chunk
-        body = body[:need]
-    return status, body.decode("utf-8", "replace")
+        te = re.search(rb"[Tt]ransfer-[Ee]ncoding: ([^\r\n]+)", head)
+        cl = re.search(rb"[Cc]ontent-[Ll]ength: (\d+)", head)
+        if te and "chunked" in te.group(1).decode("utf-8", "replace").lower():
+            body = b""
+            while True:
+                size_line = reader.read_line(MAX_HEADER_BYTES).strip()
+                try:
+                    size = int(size_line.split(b";")[0], 16)
+                except ValueError:
+                    return None, None
+                if size == 0:
+                    # Consume any trailer lines up to the blank line.
+                    while reader.read_line(MAX_HEADER_BYTES) != b"\r\n":
+                        pass
+                    break
+                body += reader.read_exact(size, MAX_BODY_BYTES)
+                if len(body) > MAX_BODY_BYTES:
+                    return None, None
+                reader.read_exact(2, MAX_HEADER_BYTES)  # trailing CRLF
+        elif cl:
+            need = int(cl.group(1))
+            if need > MAX_BODY_BYTES:
+                return None, None
+            try:
+                body = reader.read_exact(need, MAX_BODY_BYTES)
+            except EOFError:
+                body = reader.buf
+        else:
+            body = reader.buf
+        return status, body.decode("utf-8", "replace")
+    except (EOFError, ValueError, OSError):
+        return None, None
 
 
 def _raw_exchange(url, method, headers, body, timeout, probe_path, verbose=False):
@@ -183,13 +251,22 @@ def detect_http_smuggling(url, method='GET', data=None, headers=None, timeout=10
         ("TE.TE", {'Transfer-Encoding': 'chunked, chunked'},
          "0\r\n\r\nGET /__smuggled_tete HTTP/1.1\r\nX-Foo: bar\r\n\r\n"),
     ]
+    # The test framing headers always win. A caller supplied Content-Length
+    # or Transfer-Encoding (in any letter case) is dropped with a warning,
+    # because letting it override would quietly disarm the header conflict
+    # each test exists to create. Other custom headers are kept.
+    framing = {"content-length", "transfer-encoding"}
+    custom_clean = {}
+    for k, v in custom.items():
+        if k.lower() in framing:
+            logging.warning(f"Ignoring custom {k} header: the test framing headers take precedence.")
+        else:
+            custom_clean[k] = v
     completed = 0
     vulnerable = False
     for name, test_headers, default_body in tests:
-        merged = dict(test_headers)
-        # Custom headers win this merge, including over the test headers. A caller who passes
-        # their own Content-Length quietly disarms the conflict the test exists to create.
-        merged.update(custom)
+        merged = dict(custom_clean)
+        merged.update(test_headers)
         body = data if data is not None else default_body
         marker = "/__smuggled_" + name.lower().replace(".", "")
         done, probe_body = _raw_exchange(url, method, merged, body, timeout, "/__probe_" + name.lower().replace(".", ""), verbose)
@@ -197,10 +274,10 @@ def detect_http_smuggling(url, method='GET', data=None, headers=None, timeout=10
             logging.error(f"{name} Test: request did not complete.")
             continue
         completed += 1
-        # A positive needs the probe body to carry a marker sentence no ordinary server would
-        # ever emit for the smuggled path. A genuinely desynced server answers that request
-        # with its normal response, which I report as no vulnerability, so as written I am
-        # calibrated for a cooperating test server rather than an arbitrary one.
+        # A positive needs the probe body to carry the marker sentence for
+        # the smuggled path (see README, How detection works). This is a
+        # conservative signal: a desynced server that answers the smuggled
+        # request with an ordinary error page is reported as no finding.
         if data is None and ("SMUGGLED_RESPONSE_FOR " + marker) in probe_body:
             logging.warning(f"Potential {name} HTTP Request Smuggling Vulnerability Detected: the follow-up probe was answered with the smuggled request response.")
             vulnerable = True
